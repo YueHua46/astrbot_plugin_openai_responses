@@ -5,11 +5,17 @@
 
 ## [Unreleased]
 
+### Added
+- 新增 `prompt_cache_retention` 配置，支持显式传递 `in_memory` / `24h` 给 Responses API。
+- 新增 `log_prompt_cache` 配置，可输出缓存命中摘要日志，便于观察 `input_cached` 与命中情况。
+
 ### Changed
 - 发布工作流改为“推送 `master` 自动触发”，版本统一读取 `metadata.yaml`。
 - 当同版本 Release 已存在时，自动执行覆盖更新（更新说明并覆盖 zip 资产）。
 - 新增 `RELEASING.md`，明确 AstrBot 更新机制适配与发布约束。
 - README 补充“更新机制（AstrBot）”说明，强调可通过 WebUI 更新插件。
+- 当上游明确返回 `param=prompt_cache_retention` 错误时，自动移除该字段并重试一次，提升代理与旧上游兼容性。
+- README 补充 Prompt Caching 配置说明，并提示 `24h` 会改变缓存保留语义。
 
 ## [0.1.6] - 2026-02-22
 

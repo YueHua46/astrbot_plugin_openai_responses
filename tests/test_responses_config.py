@@ -29,6 +29,8 @@ def test_normalize_provider_config_sets_codex_defaults():
     assert result.config["codex_turn_state_enabled"] is True
     assert result.config["codex_parallel_tool_calls"] is True
     assert result.config["codex_context_prune_strategy"] == "pair_aware"
+    assert result.config["prompt_cache_retention"] == ""
+    assert result.config["log_prompt_cache"] is False
 
 
 def test_normalize_provider_config_warns_on_invalid_codex_fields():
@@ -45,3 +47,18 @@ def test_normalize_provider_config_warns_on_invalid_codex_fields():
     assert any("codex_mode" in w for w in result.warnings)
     assert any("codex_transport" in w for w in result.warnings)
     assert any("codex_context_prune_strategy" in w for w in result.warnings)
+
+
+def test_normalize_provider_config_keeps_supported_prompt_cache_retention_values():
+    in_memory = normalize_provider_config({"prompt_cache_retention": "in_memory"})
+    extended = normalize_provider_config({"prompt_cache_retention": "24h"})
+
+    assert in_memory.config["prompt_cache_retention"] == "in_memory"
+    assert extended.config["prompt_cache_retention"] == "24h"
+
+
+def test_normalize_provider_config_warns_on_invalid_prompt_cache_retention():
+    result = normalize_provider_config({"prompt_cache_retention": "forever"})
+
+    assert result.config["prompt_cache_retention"] == ""
+    assert any("prompt_cache_retention" in w for w in result.warnings)

@@ -22,6 +22,8 @@
 - `timeout`：超时秒数（默认 `120`）
 - `proxy`：代理地址（如 `http://127.0.0.1:7890`）
 - `reasoning_effort`：`low/medium/high/xhigh`
+- `prompt_cache_retention`：可选 `in_memory` 或 `24h`。默认留空，表示不显式发送该参数，交由上游使用默认缓存策略。
+- `log_prompt_cache`：是否输出缓存命中摘要日志。开启后会记录 `hit`、`input_cached`、`input_other`、`output` 等字段，便于观察是否命中缓存降费。
 
 其余配置项（如 `codex_*`、`tool_fallback_*`）建议保持默认，通常无需手动调整。
 
@@ -36,6 +38,9 @@
 ## 使用建议
 
 - 若你主要是日常聊天/工具调用，默认配置即可。
+- 需要更显式地控制 OpenAI Prompt Caching 时，可按需设置 `prompt_cache_retention`。
+- `24h` 属于显式 opt-in，会改变缓存保留时长语义；若你对数据保留、Zero Data Retention 或代理兼容性敏感，建议先在测试环境验证。
+- 若要确认是否真正命中缓存并减少计费，可开启 `log_prompt_cache`，观察日志中的 `hit` 与 `input_cached`。
 - 使用 Codex 系列模型时，建议不要关闭 `codex_*` 相关默认开关。
 - 若更新插件后行为异常，优先重启 AstrBot 再重试。
 

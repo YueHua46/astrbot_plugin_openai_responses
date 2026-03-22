@@ -8,10 +8,14 @@ from astrbot.core.provider.entities import LLMResponse
 try:
     # When running tests from the plugin repository root
     from provider_responses import ProviderOpenAIResponsesPlugin
+    import provider_responses as provider_responses_module
 except ImportError:  # pragma: no cover
     # When running tests from an AstrBot repository checkout
     from data.plugins.astrbot_plugin_openai_responses.provider_responses import (
         ProviderOpenAIResponsesPlugin,
+    )
+    from data.plugins.astrbot_plugin_openai_responses import (
+        provider_responses as provider_responses_module,
     )
 
 
@@ -735,6 +739,204 @@ async def test_query_stream_falls_back_to_text_from_response_completed_without_u
 
 
 @pytest.mark.asyncio
+async def test_query_stream_logs_prompt_cache_hit_summary(monkeypatch):
+    provider = _make_provider(overrides={"log_prompt_cache": True})
+    logged_messages: list[str] = []
+
+    def _fake_log_info(message, *args, **kwargs):
+        logged_messages.append(message % args if args else str(message))
+
+    async def _fake_iter_responses_sse(*, request_body, api_key):
+        assert request_body["stream"] is True
+        assert api_key == "test-key"
+        yield (
+            "response.created",
+            {"type": "response.created", "response": {"id": "resp_cache_hit"}},
+        )
+        yield (
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": {
+                    "usage": {
+                        "input_tokens": 10,
+                        "input_tokens_details": {"cached_tokens": 4},
+                        "output_tokens": 3,
+                    },
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "cached"}],
+                        }
+                    ],
+                },
+            },
+        )
+
+    monkeypatch.setattr(provider_responses_module.logger, "info", _fake_log_info)
+    monkeypatch.setattr(provider, "_iter_responses_sse", _fake_iter_responses_sse)
+
+    payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+    outputs = []
+    async for resp in provider._query_stream(payloads, None, api_key="test-key"):
+        outputs.append(resp)
+
+    assert outputs[-1].completion_text == "cached"
+    assert any(
+        "Responses prompt cache summary." in message
+        and "hit=True" in message
+        and "prompt_cache_retention=omitted" in message
+        and "input_cached=4" in message
+        for message in logged_messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_query_stream_logs_prompt_cache_miss_summary(monkeypatch):
+    provider = _make_provider(
+        overrides={"log_prompt_cache": True, "prompt_cache_retention": "24h"}
+    )
+    logged_messages: list[str] = []
+
+    def _fake_log_info(message, *args, **kwargs):
+        logged_messages.append(message % args if args else str(message))
+
+    async def _fake_iter_responses_sse(*, request_body, api_key):
+        assert request_body["prompt_cache_retention"] == "24h"
+        assert api_key == "test-key"
+        yield (
+            "response.created",
+            {"type": "response.created", "response": {"id": "resp_cache_miss"}},
+        )
+        yield (
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": {
+                    "usage": {
+                        "input_tokens": 9,
+                        "input_tokens_details": {"cached_tokens": 0},
+                        "output_tokens": 2,
+                    },
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "miss"}],
+                        }
+                    ],
+                },
+            },
+        )
+
+    monkeypatch.setattr(provider_responses_module.logger, "info", _fake_log_info)
+    monkeypatch.setattr(provider, "_iter_responses_sse", _fake_iter_responses_sse)
+
+    payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+    outputs = []
+    async for resp in provider._query_stream(payloads, None, api_key="test-key"):
+        outputs.append(resp)
+
+    assert outputs[-1].completion_text == "miss"
+    assert any(
+        "Responses prompt cache summary." in message
+        and "hit=False" in message
+        and "prompt_cache_retention=24h" in message
+        and "input_cached=0" in message
+        for message in logged_messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_query_stream_does_not_log_prompt_cache_summary_without_usage(monkeypatch):
+    provider = _make_provider(overrides={"log_prompt_cache": True})
+    logged_messages: list[str] = []
+
+    def _fake_log_info(message, *args, **kwargs):
+        logged_messages.append(message % args if args else str(message))
+
+    async def _fake_iter_responses_sse(*, request_body, api_key):
+        assert api_key == "test-key"
+        yield (
+            "response.created",
+            {"type": "response.created", "response": {"id": "resp_no_usage"}},
+        )
+        yield (
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": {
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "final text"}],
+                        }
+                    ],
+                },
+            },
+        )
+
+    monkeypatch.setattr(provider_responses_module.logger, "info", _fake_log_info)
+    monkeypatch.setattr(provider, "_iter_responses_sse", _fake_iter_responses_sse)
+
+    payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+    outputs = []
+    async for resp in provider._query_stream(payloads, None, api_key="test-key"):
+        outputs.append(resp)
+
+    assert outputs[-1].completion_text == "final text"
+    assert not any("Responses prompt cache summary." in message for message in logged_messages)
+
+
+@pytest.mark.asyncio
+async def test_query_stream_does_not_log_prompt_cache_summary_when_disabled(monkeypatch):
+    provider = _make_provider()
+    logged_messages: list[str] = []
+
+    def _fake_log_info(message, *args, **kwargs):
+        logged_messages.append(message % args if args else str(message))
+
+    async def _fake_iter_responses_sse(*, request_body, api_key):
+        assert api_key == "test-key"
+        yield (
+            "response.created",
+            {
+                "type": "response.created",
+                "response": {"id": "resp_logging_disabled"},
+            },
+        )
+        yield (
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": {
+                    "usage": {
+                        "input_tokens": 7,
+                        "input_tokens_details": {"cached_tokens": 3},
+                        "output_tokens": 1,
+                    },
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "final text"}],
+                        }
+                    ],
+                },
+            },
+        )
+
+    monkeypatch.setattr(provider_responses_module.logger, "info", _fake_log_info)
+    monkeypatch.setattr(provider, "_iter_responses_sse", _fake_iter_responses_sse)
+
+    payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+    outputs = []
+    async for resp in provider._query_stream(payloads, None, api_key="test-key"):
+        outputs.append(resp)
+
+    assert outputs[-1].completion_text == "final text"
+    assert not any("Responses prompt cache summary." in message for message in logged_messages)
+
+
+@pytest.mark.asyncio
 async def test_query_stream_aligns_completion_when_output_text_done_is_emitted(
     monkeypatch,
 ):
@@ -791,6 +993,25 @@ def test_build_responses_request_is_stateless_and_does_not_set_previous_response
     assert "previous_response_id" not in request
 
 
+def test_build_responses_request_sets_prompt_cache_retention_when_configured():
+    provider = _make_provider(overrides={"prompt_cache_retention": "24h"})
+    payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+
+    request = provider._build_responses_request(payloads, None)
+
+    assert request["prompt_cache_retention"] == "24h"
+    assert "prompt_cache_key" not in request
+
+
+def test_build_responses_request_omits_prompt_cache_retention_when_not_configured():
+    provider = _make_provider()
+    payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+
+    request = provider._build_responses_request(payloads, None)
+
+    assert "prompt_cache_retention" not in request
+
+
 def test_build_responses_request_codex_profile_sets_instructions_and_auto_tools():
     provider = _make_provider(
         overrides={
@@ -819,6 +1040,62 @@ def test_build_responses_request_codex_profile_sets_instructions_and_auto_tools(
     assert request["prompt_cache_key"].isascii()
     assert request["prompt_cache_key"] == request_2["prompt_cache_key"]
     assert request["input"][0]["role"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_query_stream_retries_once_without_prompt_cache_retention_on_param_error(
+    monkeypatch,
+):
+    provider = _make_provider(overrides={"prompt_cache_retention": "24h"})
+    payloads = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    try:
+        from responses_errors import UpstreamResponsesError
+    except ImportError:  # pragma: no cover
+        from data.plugins.astrbot_plugin_openai_responses.responses_errors import (
+            UpstreamResponsesError,
+        )
+
+    seen_retention_values: list[str | None] = []
+
+    async def _fake_iter_responses_sse(*, request_body, api_key):
+        assert api_key == "test-key"
+        seen_retention_values.append(request_body.get("prompt_cache_retention"))
+        if len(seen_retention_values) == 1:
+            assert request_body.get("prompt_cache_retention") == "24h"
+            raise UpstreamResponsesError(
+                "invalid prompt cache retention",
+                status_code=400,
+                body={
+                    "error": {
+                        "message": "Invalid 'prompt_cache_retention'",
+                        "param": "prompt_cache_retention",
+                    }
+                },
+            )
+
+        assert "prompt_cache_retention" not in request_body
+        yield (
+            "response.created",
+            {"type": "response.created", "response": {"id": "resp_1"}},
+        )
+        yield (
+            "response.output_text.delta",
+            {"type": "response.output_text.delta", "delta": "ok"},
+        )
+        yield ("response.completed", {"type": "response.completed", "response": {}})
+
+    monkeypatch.setattr(provider, "_iter_responses_sse", _fake_iter_responses_sse)
+
+    outputs = []
+    async for resp in provider._query_stream(payloads, None, api_key="test-key"):
+        outputs.append(resp)
+
+    assert seen_retention_values == ["24h", None]
+    assert outputs[-1].completion_text == "ok"
 
 
 @pytest.mark.asyncio

@@ -77,6 +77,7 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
 
     _ERROR_TEXT_CANDIDATE_MAX_CHARS = 4096
     _TOOL_FALLBACK_MODES = {"parse_then_retry", "retry_only", "parse_only"}
+    _RECOVERABLE_REQUEST_PARAMS = ("prompt_cache_key", "prompt_cache_retention")
 
     def __init__(self, provider_config: dict, provider_settings: dict) -> None:
         normalized = normalize_provider_config(provider_config)
@@ -231,6 +232,67 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
     def _tool_fallback_stream_buffer_enabled(self) -> bool:
         raw = self.provider_config.get("tool_fallback_stream_buffer", True)
         return self._coerce_bool(raw, True)
+
+    def _prompt_cache_retention(self) -> str | None:
+        raw = self.provider_config.get("prompt_cache_retention", "")
+        if not isinstance(raw, str):
+            return None
+        normalized = raw.strip().lower()
+        return normalized or None
+
+    def _usage_logging_enabled(self) -> bool:
+        return self._coerce_bool(self.provider_config.get("log_usage", False), False)
+
+    def _prompt_cache_logging_enabled(self) -> bool:
+        return self._coerce_bool(
+            self.provider_config.get("log_prompt_cache", False), False
+        )
+
+    @staticmethod
+    def _build_usage_summary(
+        response: LLMResponse | None,
+    ) -> dict[str, int] | None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        return {
+            "input_other": usage.input_other,
+            "input_cached": usage.input_cached,
+            "output": usage.output,
+        }
+
+    def _log_prompt_cache_summary(
+        self,
+        response: LLMResponse | None,
+        *,
+        request_body: dict[str, Any],
+        model: Any,
+        stream: bool,
+    ) -> None:
+        if not self._prompt_cache_logging_enabled():
+            return
+
+        usage_summary = self._build_usage_summary(response)
+        if usage_summary is None:
+            return
+
+        retention = request_body.get("prompt_cache_retention")
+        if not isinstance(retention, str) or not retention:
+            retention = "omitted"
+
+        input_cached = int(usage_summary["input_cached"])
+        logger.info(
+            "Responses prompt cache summary. response_id=%s model=%s stream=%s "
+            "prompt_cache_retention=%s hit=%s input_cached=%s input_other=%s output=%s",
+            getattr(response, "id", None) if response is not None else None,
+            model,
+            stream,
+            retention,
+            input_cached > 0,
+            input_cached,
+            usage_summary["input_other"],
+            usage_summary["output"],
+        )
 
     def _resolve_runtime_mode(self, *, model: str) -> RuntimeModeResolution:
         return resolve_runtime_mode(
@@ -588,6 +650,9 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             "input": self._convert_chat_messages_to_responses_input(message_items),
             "stream": True,
         }
+        prompt_cache_retention = self._prompt_cache_retention()
+        if prompt_cache_retention is not None:
+            request_body["prompt_cache_retention"] = prompt_cache_retention
         if runtime_mode.is_codex_chatgpt and instructions:
             request_body["instructions"] = instructions
 
@@ -708,7 +773,7 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             response_format=response_format,
             tool_choice_override=tool_choice_override,
         )
-        recovered_without_prompt_cache_key = False
+        recovered_request_params: dict[str, str] = {}
 
         while True:
             processor = ResponsesStreamAccumulator(
@@ -726,33 +791,32 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                     for chunk in processor.handle_event(event_type, event_data):
                         yield chunk
             except Exception as exc:
-                prompt_cache_key = request_body.get("prompt_cache_key")
-                if (
-                    not recovered_without_prompt_cache_key
-                    and isinstance(prompt_cache_key, str)
-                    and self._is_prompt_cache_key_invalid(exc)
-                ):
-                    recovered_without_prompt_cache_key = True
-                    request_body = dict(request_body)
-                    request_body.pop("prompt_cache_key", None)
-                    logger.warning(
-                        "Responses request rejected prompt_cache_key, retrying once without it. "
-                        "model=%s stream=%s prompt_cache_key_len=%s",
-                        payloads.get("model"),
-                        True,
-                        len(prompt_cache_key),
-                    )
+                recovered = self._recover_request_parameter_once(
+                    request_body=request_body,
+                    error=exc,
+                    payloads=payloads,
+                    recovered_request_params=recovered_request_params,
+                    stream=True,
+                )
+                if recovered is not None:
+                    request_body = recovered
                     continue
                 raise
 
             final_response = processor.build_final_response(tools_provided=tools is not None)
-            if recovered_without_prompt_cache_key:
+            for recovered_param in recovered_request_params:
                 logger.info(
-                    "Responses request recovered after dropping prompt_cache_key. "
-                    "model=%s stream=%s",
+                    "Responses request recovered after dropping %s. model=%s stream=%s",
+                    recovered_param,
                     payloads.get("model"),
                     True,
                 )
+            self._log_prompt_cache_summary(
+                final_response,
+                request_body=request_body,
+                model=payloads.get("model"),
+                stream=True,
+            )
             yield final_response
             return
 
@@ -905,7 +969,15 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                     return True
         return False
 
-    def _is_prompt_cache_key_invalid(self, error: Exception) -> bool:
+    def _is_request_parameter_invalid(
+        self,
+        error: Exception,
+        parameter_name: str,
+    ) -> bool:
+        normalized_parameter = parameter_name.strip()
+        if not normalized_parameter:
+            return False
+
         status_code = getattr(error, "status_code", None)
         if status_code is not None and status_code != 400:
             return False
@@ -915,17 +987,67 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             err_payload = body.get("error")
             if isinstance(err_payload, dict):
                 param = err_payload.get("param")
-                if isinstance(param, str) and param.strip() == "prompt_cache_key":
+                if isinstance(param, str) and param.strip() == normalized_parameter:
                     return True
                 message = err_payload.get("message")
-                if isinstance(message, str) and "prompt_cache_key" in message.lower():
+                if (
+                    isinstance(message, str)
+                    and normalized_parameter.lower() in message.lower()
+                ):
                     return True
             param = body.get("param")
-            if isinstance(param, str) and param.strip() == "prompt_cache_key":
+            if isinstance(param, str) and param.strip() == normalized_parameter:
                 return True
 
         candidates = self._extract_error_text_candidates(error)
-        return any("prompt_cache_key" in candidate.lower() for candidate in candidates)
+        normalized_parameter = normalized_parameter.lower()
+        return any(normalized_parameter in candidate.lower() for candidate in candidates)
+
+    def _recover_request_parameter_once(
+        self,
+        *,
+        request_body: dict[str, Any],
+        error: Exception,
+        payloads: dict[str, Any],
+        recovered_request_params: dict[str, str],
+        stream: bool,
+    ) -> dict[str, Any] | None:
+        for parameter_name in self._RECOVERABLE_REQUEST_PARAMS:
+            if parameter_name in recovered_request_params:
+                continue
+
+            parameter_value = request_body.get(parameter_name)
+            if not isinstance(parameter_value, str) or not parameter_value:
+                continue
+
+            if not self._is_request_parameter_invalid(error, parameter_name):
+                continue
+
+            recovered_request_params[parameter_name] = parameter_value
+            updated_request_body = dict(request_body)
+            updated_request_body.pop(parameter_name, None)
+
+            if parameter_name == "prompt_cache_key":
+                logger.warning(
+                    "Responses request rejected %s, retrying once without it. "
+                    "model=%s stream=%s value_len=%s",
+                    parameter_name,
+                    payloads.get("model"),
+                    stream,
+                    len(parameter_value),
+                )
+            else:
+                logger.warning(
+                    "Responses request rejected %s, retrying once without it. "
+                    "model=%s stream=%s value=%s",
+                    parameter_name,
+                    payloads.get("model"),
+                    stream,
+                    parameter_value,
+                )
+            return updated_request_body
+
+        return None
 
     async def _handle_api_error(
         self,
@@ -1097,16 +1219,9 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                 if last_chunk is None:
                     raise Exception("Empty responses stream")
                 duration_ms = int((time.perf_counter() - attempt_start) * 1000)
-                log_usage_enabled = self._coerce_bool(
-                    self.provider_config.get("log_usage", False), False
-                )
                 usage_summary = None
-                if log_usage_enabled and last_chunk.usage is not None:
-                    usage_summary = {
-                        "input_other": last_chunk.usage.input_other,
-                        "input_cached": last_chunk.usage.input_cached,
-                        "output": last_chunk.usage.output,
-                    }
+                if self._usage_logging_enabled():
+                    usage_summary = self._build_usage_summary(last_chunk)
                 logger.info(
                     "Responses request succeeded. attempt=%s duration_ms=%s error_type=%s response_id=%s model=%s stream=%s tool_enabled=%s usage=%s",
                     attempt_no,
@@ -1356,16 +1471,9 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                         last_response = response
                         yield response
                     duration_ms = int((time.perf_counter() - attempt_start) * 1000)
-                    log_usage_enabled = self._coerce_bool(
-                        self.provider_config.get("log_usage", False), False
-                    )
                     usage_summary = None
-                    if log_usage_enabled and last_response and last_response.usage is not None:
-                        usage_summary = {
-                            "input_other": last_response.usage.input_other,
-                            "input_cached": last_response.usage.input_cached,
-                            "output": last_response.usage.output,
-                        }
+                    if self._usage_logging_enabled():
+                        usage_summary = self._build_usage_summary(last_response)
                     logger.info(
                         "Responses stream succeeded. attempt=%s duration_ms=%s error_type=%s response_id=%s model=%s stream=%s tool_enabled=%s usage=%s",
                         attempt_no,
@@ -1538,16 +1646,9 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                     if not yielded_any:
                         raise Exception("Empty responses stream")
                     duration_ms = int((time.perf_counter() - attempt_start) * 1000)
-                    log_usage_enabled = self._coerce_bool(
-                        self.provider_config.get("log_usage", False), False
-                    )
                     usage_summary = None
-                    if log_usage_enabled and last_response and last_response.usage is not None:
-                        usage_summary = {
-                            "input_other": last_response.usage.input_other,
-                            "input_cached": last_response.usage.input_cached,
-                            "output": last_response.usage.output,
-                        }
+                    if self._usage_logging_enabled():
+                        usage_summary = self._build_usage_summary(last_response)
                     logger.info(
                         "Responses stream succeeded. attempt=%s duration_ms=%s error_type=%s response_id=%s model=%s stream=%s tool_enabled=%s usage=%s",
                         attempt_no,
@@ -1605,16 +1706,9 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                     last_response = item
                     yield item
                 duration_ms = int((time.perf_counter() - attempt_start) * 1000)
-                log_usage_enabled = self._coerce_bool(
-                    self.provider_config.get("log_usage", False), False
-                )
                 usage_summary = None
-                if log_usage_enabled and last_response and last_response.usage is not None:
-                    usage_summary = {
-                        "input_other": last_response.usage.input_other,
-                        "input_cached": last_response.usage.input_cached,
-                        "output": last_response.usage.output,
-                    }
+                if self._usage_logging_enabled():
+                    usage_summary = self._build_usage_summary(last_response)
                 logger.info(
                     "Responses stream succeeded. attempt=%s duration_ms=%s error_type=%s response_id=%s model=%s stream=%s tool_enabled=%s usage=%s",
                     attempt_no,

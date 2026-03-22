@@ -15,6 +15,7 @@ except ImportError:  # pragma: no cover
 
 
 _TOOL_FALLBACK_MODES = {"parse_then_retry", "retry_only", "parse_only"}
+_PROMPT_CACHE_RETENTION_VALUES = {"in_memory", "24h"}
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,20 @@ def normalize_provider_config(raw_config: dict[str, Any]) -> ConfigNormalization
         api_base = str(api_base)
     api_base = api_base.strip() or "https://api.openai.com/v1"
     config["api_base"] = api_base
+
+    prompt_cache_retention = config.get("prompt_cache_retention", "")
+    if prompt_cache_retention is None:
+        prompt_cache_retention = ""
+    elif not isinstance(prompt_cache_retention, str):
+        prompt_cache_retention = str(prompt_cache_retention)
+    prompt_cache_retention = prompt_cache_retention.strip().lower()
+    if prompt_cache_retention and prompt_cache_retention not in _PROMPT_CACHE_RETENTION_VALUES:
+        warnings.append(
+            "Unknown `prompt_cache_retention` value "
+            f"{prompt_cache_retention!r}; fallback to omitted."
+        )
+        prompt_cache_retention = ""
+    config["prompt_cache_retention"] = prompt_cache_retention
 
     proxy = config.get("proxy", "") or ""
     if not isinstance(proxy, str):
@@ -185,6 +200,9 @@ def normalize_provider_config(raw_config: dict[str, Any]) -> ConfigNormalization
     config["codex_context_prune_strategy"] = codex_prune
 
     config["log_usage"] = _coerce_bool(config.get("log_usage", False), False)
+    config["log_prompt_cache"] = _coerce_bool(
+        config.get("log_prompt_cache", False), False
+    )
 
     def _coerce_bounded_int(
         value: Any,
