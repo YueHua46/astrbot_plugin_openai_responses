@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import json
 import random
 import time
@@ -189,6 +190,188 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             if normalized in {"0", "false", "no", "off"}:
                 return False
         return default
+
+    @staticmethod
+    def _normalize_web_search_context_size(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip().lower()
+        if normalized in {"low", "medium", "high"}:
+            return normalized
+        return None
+
+    def _build_web_search_tool(self) -> dict[str, Any]:
+        web_search_tool: dict[str, Any] = {"type": "web_search"}
+        context_size = self._normalize_web_search_context_size(
+            self.provider_config.get("web_search_context_size", "")
+        )
+        if context_size is not None:
+            web_search_tool["search_context_size"] = context_size
+        external_web_access = self.provider_config.get(
+            "web_search_external_web_access", None
+        )
+        if isinstance(external_web_access, bool):
+            web_search_tool["external_web_access"] = external_web_access
+        return web_search_tool
+
+    @staticmethod
+    def _has_tool_type(tools: list[Any], tool_type: str) -> bool:
+        return any(
+            isinstance(item, dict) and str(item.get("type", "")) == tool_type
+            for item in tools
+        )
+
+    def _apply_web_search_config(self, request_body: dict[str, Any]) -> None:
+        enable_web_search = self._coerce_bool(
+            self.provider_config.get("enable_web_search", False),
+            False,
+        )
+        if not enable_web_search:
+            return
+
+        raw_tools = request_body.get("tools")
+        if not isinstance(raw_tools, list):
+            request_body["tools"] = []
+        if not self._has_tool_type(request_body["tools"], "web_search"):
+            request_body["tools"].append(self._build_web_search_tool())
+
+        request_body.setdefault("tool_choice", "auto")
+
+        include_sources = self._coerce_bool(
+            self.provider_config.get("web_search_include_sources", True),
+            True,
+        )
+        if include_sources:
+            raw_include = request_body.get("include")
+            if not isinstance(raw_include, list):
+                request_body["include"] = []
+            if "web_search_call.action.sources" not in request_body["include"]:
+                request_body["include"].append("web_search_call.action.sources")
+
+    @staticmethod
+    def _merge_list_item_key(item: Any) -> str:
+        if isinstance(item, dict):
+            try:
+                normalized = json.dumps(item, sort_keys=True, ensure_ascii=False, default=str)
+            except TypeError:
+                normalized = repr(item)
+            return "dict:" + normalized
+        if isinstance(item, list):
+            try:
+                normalized = json.dumps(item, ensure_ascii=False, default=str)
+            except TypeError:
+                normalized = repr(item)
+            return "list:" + normalized
+        return "scalar:" + repr(item)
+
+    @staticmethod
+    def _tool_signature(tool: Any) -> str | None:
+        if not isinstance(tool, dict):
+            return None
+        tool_type = str(tool.get("type", "")).strip()
+        if not tool_type:
+            return None
+        tool_name = str(tool.get("name", "")).strip()
+        if tool_type == "function":
+            return f"function:{tool_name}"
+        if tool_name:
+            return f"{tool_type}:{tool_name}"
+        return f"{tool_type}:"
+
+    def _merge_extra_value(
+        self,
+        base_value: Any,
+        extra_value: Any,
+        *,
+        path: tuple[str, ...],
+    ) -> Any:
+        if isinstance(base_value, dict) and isinstance(extra_value, dict):
+            merged_dict = copy.deepcopy(base_value)
+            for key, value in extra_value.items():
+                key_str = str(key)
+                if key_str in merged_dict:
+                    merged_dict[key_str] = self._merge_extra_value(
+                        merged_dict[key_str],
+                        value,
+                        path=path + (key_str,),
+                    )
+                else:
+                    merged_dict[key_str] = copy.deepcopy(value)
+            return merged_dict
+
+        if isinstance(base_value, list) and isinstance(extra_value, list):
+            return self._merge_extra_list(base_value, extra_value, path=path)
+
+        return copy.deepcopy(extra_value)
+
+    def _merge_extra_list(
+        self,
+        base_list: list[Any],
+        extra_list: list[Any],
+        *,
+        path: tuple[str, ...],
+    ) -> list[Any]:
+        if path and path[-1] == "tools":
+            return self._merge_extra_tools_list(base_list, extra_list)
+
+        merged_list = copy.deepcopy(base_list)
+        existing_keys = {self._merge_list_item_key(item) for item in merged_list}
+        for item in extra_list:
+            item_key = self._merge_list_item_key(item)
+            if item_key in existing_keys:
+                continue
+            merged_list.append(copy.deepcopy(item))
+            existing_keys.add(item_key)
+        return merged_list
+
+    def _merge_extra_tools_list(
+        self,
+        base_tools: list[Any],
+        extra_tools: list[Any],
+    ) -> list[Any]:
+        merged_tools = copy.deepcopy(base_tools)
+        signature_to_index: dict[str, int] = {}
+        existing_keys = {self._merge_list_item_key(item) for item in merged_tools}
+        for idx, tool in enumerate(merged_tools):
+            signature = self._tool_signature(tool)
+            if signature and signature not in signature_to_index:
+                signature_to_index[signature] = idx
+
+        for tool in extra_tools:
+            signature = self._tool_signature(tool)
+            if signature and signature in signature_to_index:
+                existing_idx = signature_to_index[signature]
+                existing_tool = merged_tools[existing_idx]
+                if isinstance(existing_tool, dict) and isinstance(tool, dict):
+                    merged_tools[existing_idx] = self._merge_extra_value(
+                        existing_tool,
+                        tool,
+                        path=("tools",),
+                    )
+                continue
+
+            item_key = self._merge_list_item_key(tool)
+            if item_key in existing_keys:
+                continue
+
+            merged_tools.append(copy.deepcopy(tool))
+            existing_keys.add(item_key)
+            if signature:
+                signature_to_index[signature] = len(merged_tools) - 1
+        return merged_tools
+
+    def _merge_custom_extra_body(
+        self,
+        request_body: dict[str, Any],
+    ) -> dict[str, Any]:
+        custom_extra_body = self.provider_config.get("custom_extra_body", {})
+        if not isinstance(custom_extra_body, dict):
+            return request_body
+        return self._merge_extra_value(
+            request_body,
+            custom_extra_body,
+            path=(),
+        )
 
     def _tool_fallback_enabled(self, tools: ToolSet | None) -> bool:
         if tools is None:
@@ -686,6 +869,8 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                         self._codex_parallel_tool_calls_enabled()
                     )
 
+        self._apply_web_search_config(request_body)
+
         effort_source = reasoning_effort
         if effort_source is None:
             effort_source = self.provider_config.get("reasoning_effort")
@@ -714,9 +899,7 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                         response_fmt["strict"] = json_schema_obj.get("strict")
                     request_body["text"] = {"format": response_fmt}
 
-        custom_extra_body = self.provider_config.get("custom_extra_body", {})
-        if isinstance(custom_extra_body, dict):
-            request_body.update(custom_extra_body)
+        request_body = self._merge_custom_extra_body(request_body)
 
         return request_body
 

@@ -62,3 +62,33 @@ def test_normalize_provider_config_warns_on_invalid_prompt_cache_retention():
 
     assert result.config["prompt_cache_retention"] == ""
     assert any("prompt_cache_retention" in w for w in result.warnings)
+
+
+def test_normalize_provider_config_sets_web_search_defaults():
+    result = normalize_provider_config({})
+
+    assert result.config["enable_web_search"] is False
+    assert result.config["web_search_context_size"] == "medium"
+    assert result.config["web_search_external_web_access"] is True
+    assert result.config["web_search_include_sources"] is True
+
+
+def test_normalize_provider_config_coerces_web_search_boolean_fields():
+    result = normalize_provider_config(
+        {
+            "enable_web_search": "true",
+            "web_search_external_web_access": "false",
+            "web_search_include_sources": "0",
+        }
+    )
+
+    assert result.config["enable_web_search"] is True
+    assert result.config["web_search_external_web_access"] is False
+    assert result.config["web_search_include_sources"] is False
+
+
+def test_normalize_provider_config_warns_and_fallbacks_web_search_context_size():
+    result = normalize_provider_config({"web_search_context_size": "ultra"})
+
+    assert result.config["web_search_context_size"] == "medium"
+    assert any("web_search_context_size" in w for w in result.warnings)

@@ -993,6 +993,149 @@ def test_build_responses_request_is_stateless_and_does_not_set_previous_response
     assert "previous_response_id" not in request
 
 
+def test_build_responses_request_appends_web_search_tool_when_enabled():
+    provider = _make_provider(overrides={"enable_web_search": True})
+    payloads = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
+
+    request = provider._build_responses_request(payloads, None)
+
+    assert request["tools"] == [{"type": "web_search"}]
+    assert request["tool_choice"] == "auto"
+    assert request["include"] == ["web_search_call.action.sources"]
+
+
+def test_build_responses_request_keeps_function_tools_and_appends_web_search():
+    provider = _make_provider(overrides={"enable_web_search": True})
+    tools = _make_tool_set()
+    payloads = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
+
+    request = provider._build_responses_request(payloads, tools)
+
+    assert len(request["tools"]) == 2
+    assert request["tools"][0]["type"] == "function"
+    assert request["tools"][1] == {"type": "web_search"}
+    assert request["tool_choice"] == "auto"
+
+
+def test_build_responses_request_applies_web_search_options():
+    provider = _make_provider(
+        overrides={
+            "enable_web_search": True,
+            "web_search_context_size": "high",
+            "web_search_external_web_access": False,
+        }
+    )
+    payloads = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
+
+    request = provider._build_responses_request(payloads, None)
+
+    assert request["tools"] == [
+        {
+            "type": "web_search",
+            "search_context_size": "high",
+            "external_web_access": False,
+        }
+    ]
+
+
+def test_build_responses_request_can_disable_web_search_sources_include():
+    provider = _make_provider(
+        overrides={
+            "enable_web_search": True,
+            "web_search_include_sources": False,
+        }
+    )
+    payloads = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
+
+    request = provider._build_responses_request(payloads, None)
+
+    assert "include" not in request
+
+
+def test_build_responses_request_merges_custom_extra_tools_without_overwrite():
+    provider = _make_provider(
+        overrides={
+            "enable_web_search": True,
+            "custom_extra_body": {
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "custom_tool",
+                        "description": "custom tool from extra body",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                    {"type": "web_search", "search_context_size": "high"},
+                ]
+            },
+        }
+    )
+    tools = _make_tool_set()
+    payloads = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
+
+    request = provider._build_responses_request(payloads, tools)
+
+    tool_names = [tool.get("name") for tool in request["tools"] if isinstance(tool, dict)]
+    assert "test_tool" in tool_names
+    assert "custom_tool" in tool_names
+
+    web_search_tools = [
+        tool
+        for tool in request["tools"]
+        if isinstance(tool, dict) and tool.get("type") == "web_search"
+    ]
+    assert len(web_search_tools) == 1
+    assert web_search_tools[0]["search_context_size"] == "high"
+
+
+def test_build_responses_request_merges_custom_include_without_duplicates():
+    provider = _make_provider(
+        overrides={
+            "enable_web_search": True,
+            "custom_extra_body": {
+                "include": [
+                    "response.output_text.logprobs",
+                    "web_search_call.action.sources",
+                ]
+            },
+        }
+    )
+    payloads = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
+
+    request = provider._build_responses_request(payloads, None)
+
+    assert "response.output_text.logprobs" in request["include"]
+    assert request["include"].count("web_search_call.action.sources") == 1
+
+
+def test_build_responses_request_deep_merges_custom_text_fields():
+    provider = _make_provider(
+        overrides={
+            "custom_extra_body": {
+                "text": {"verbosity": "high"},
+            }
+        }
+    )
+    payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+
+    request = provider._build_responses_request(
+        payloads,
+        None,
+        response_format={"type": "json_object"},
+    )
+
+    assert request["text"]["format"]["type"] == "json_object"
+    assert request["text"]["verbosity"] == "high"
+
+
+def test_build_responses_request_allows_custom_scalar_override_after_merge():
+    provider = _make_provider(overrides={"custom_extra_body": {"stream": False}})
+    payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+
+    request = provider._build_responses_request(payloads, None)
+
+    assert request["stream"] is False
+
+
 def test_build_responses_request_sets_prompt_cache_retention_when_configured():
     provider = _make_provider(overrides={"prompt_cache_retention": "24h"})
     payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}

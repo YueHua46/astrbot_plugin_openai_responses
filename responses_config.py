@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover
 
 _TOOL_FALLBACK_MODES = {"parse_then_retry", "retry_only", "parse_only"}
 _PROMPT_CACHE_RETENTION_VALUES = {"in_memory", "24h"}
+_WEB_SEARCH_CONTEXT_SIZE_VALUES = {"low", "medium", "high"}
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,36 @@ def normalize_provider_config(raw_config: dict[str, Any]) -> ConfigNormalization
             warnings.append(
                 "Invalid `custom_extra_body`; it must be an object/dict, ignored."
             )
+
+    config["enable_web_search"] = _coerce_bool(
+        config.get("enable_web_search", False),
+        False,
+    )
+
+    web_search_context_size = config.get("web_search_context_size", "medium")
+    if not isinstance(web_search_context_size, str):
+        web_search_context_size = str(web_search_context_size)
+    web_search_context_size = web_search_context_size.strip().lower()
+    if web_search_context_size not in _WEB_SEARCH_CONTEXT_SIZE_VALUES:
+        if web_search_context_size:
+            warnings.append(
+                "Unknown `web_search_context_size` value "
+                f"{web_search_context_size!r}; fallback to medium."
+            )
+        web_search_context_size = "medium"
+    config["web_search_context_size"] = web_search_context_size
+
+    external_web_access_raw = config.get("web_search_external_web_access", True)
+    external_web_access: bool | None
+    if isinstance(external_web_access_raw, bool):
+        external_web_access = external_web_access_raw
+    else:
+        external_web_access = _coerce_bool(external_web_access_raw, True)
+    config["web_search_external_web_access"] = external_web_access
+    config["web_search_include_sources"] = _coerce_bool(
+        config.get("web_search_include_sources", True),
+        True,
+    )
 
     config["tool_fallback_enabled"] = _coerce_bool(
         config.get("tool_fallback_enabled", True),
